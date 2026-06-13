@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -182,7 +183,7 @@ class IndexDB:
         rows = cur.fetchall()
         cur.close()
         return [
-            {"id": r[0], "uuid": r[1], "type": r[2], "started_at": r[3], "finished_at": r[4], "meta": json.loads(r[5] or "{}")}
+                {"id": r[0], "uuid": r[1], "type": r[2], "started_at": r[3], "finished_at": r[4], "meta": json.loads(r[5] or "{}")}
             for r in rows
         ]
 
@@ -336,21 +337,40 @@ class BackupTool:
             self.db.delete_backups([bid])
             raise
 
+    def _generate_backup_uuid() -> str:
+        return "bk_" + uuid.uuid4().hex
+
     def perform_incremental_backup(self) -> dict:
-        backup_uuid = f"bk_{int(time.time())}"
         bmeta = {"author": self.cfg.author, "type": "incremental"}
-        bid = self.db.insert_backup(backup_uuid, "incremental", bmeta)
+
+        # insert with retry on UNIQUE conflict
+        max_retries = 3
+        last_exc = None
+        for attempt in range(1, max_retries + 1):
+            backup_uuid = _generate_backup_uuid()
+            try:
+                bid = self.db.insert_backup(backup_uuid, "incremental", bmeta)
+                break
+            except sqlite3.IntegrityError as e:
+                last_exc = e
+                try:
+                    logger.warning("insert_backup IntegrityError, retry %d/%d: %s", attempt, max_retries, e)
+                except Exception:
+                    pass
+                time.sleep(0.05 * attempt)
+        else:
+            # all retries failed
+            raise last_exc
+
         logger.info("Starting incremental backup id=%s", bid)
         try:
             for f in self._iter_files():
                 try:
                     prev = self.db.latest_file_entry(str(f))
                     if prev:
-                        # compare by mtime and hash quick-check
                         mtime = f.stat().st_mtime
                         if abs(prev["mtime"] - mtime) < 0.0001:
-                            continue  # unchanged
-                        # else compute hash to be sure
+                            continue
                         sha = sha256_file(f)
                         if sha == prev["sha256"]:
                             continue
